@@ -9,6 +9,7 @@ from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision
 
 from features import WindowFeatureExtractor, WindowFeatures, FrameSignals, build_frame_signals
+from camera_source import CameraSource
 
 # Each landmark is a MediaPipe NormalizedLandmark (has .x, .y, .z as floats in 0-1).
 # I use Any for the element type to avoid depending on MediaPipe's internal import path.
@@ -25,7 +26,8 @@ class FaceDetector:
     RIGHT_EYE: List[int] = [33, 160, 158, 133, 153, 144]
     LEFT_EYE: List[int] = [362, 385, 387, 263, 373, 380]
 
-    def __init__(self) -> None:
+    def __init__(self, source: CameraSource) -> None:
+        self.source: CameraSource = source
         """Load the model and set up the thread state. Does not open the camera."""
         # Settings for the detector
         self.options: vision.FaceLandmarkerOptions = vision.FaceLandmarkerOptions(
@@ -67,50 +69,48 @@ class FaceDetector:
         """returns: (frame, ear, features); any of them can be None"""
         with self._lock:
             return self.latest_frame, self.latest_ear, self.latest_features
-
     def _loop(self) -> None:
-        """The capture + detection loop. Runs in the background thread (internal use)."""
-        cap: cv2.VideoCapture = cv2.VideoCapture(0)  # if no image appears, try 1
-        start: float = time.time()  # reference time for the timestamps
-        try:
-            while not self._stop_event.is_set():
-                ok: bool
-                frame: np.ndarray
-                ok, frame = cap.read()  # ok is False if the camera failed
-                if not ok:
-                    print("Could not read from camera")
+        """The detection loop. Runs in the background thread (internal use)."""
+        last_id: int = -1  # id of the last frame we processed
+        while not self._stop_event.is_set():
+            frame: Optional[np.ndarray]
+            frame_id: int
+            t: float
+            frame, frame_id, t = self.source.get(last_id)  # frame is None if there is no NEW frame yet
+
+            if frame is None:
+                if not self.source.is_running():
+                    print("Camera stopped")
                     break
+                time.sleep(0.001)  # nothing new yet, don't burn CPU
+                continue
+            last_id = frame_id
 
-                h: int
-                w: int
-                h, w = frame.shape[:2]  # frame size in pixels
+            h: int
+            w: int
+            h, w = frame.shape[:2]  # frame size in pixels
 
-                # OpenCV uses BGR, MediaPipe expects RGB
-                rgb: np.ndarray = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                mp_image: mp.Image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            # OpenCV uses BGR, MediaPipe expects RGB
+            rgb: np.ndarray = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            mp_image: mp.Image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
 
-                # MediaPipe VIDEO mode needs strictly increasing timestamps in ms
-                timestamp_ms: int = int((time.time() - start) * 1000)
-                result = self.landmarker.detect_for_video(mp_image, timestamp_ms)
+            # MediaPipe VIDEO mode needs strictly increasing timestamps in ms (capture time of the frame)
+            timestamp_ms: int = int(t * 1000)
+            result = self.landmarker.detect_for_video(mp_image, timestamp_ms)
 
-                # Draw every landmark as a small green dot (display only)
-                if result.face_landmarks:  # empty list means no face
-                    points: Landmarks = result.face_landmarks[0]  # first (only) face
-                    for p in points:
-                        cv2.circle(frame, (int(p.x * w), int(p.y * h)), 1, (0, 255, 0), -1)
+            # Draw every landmark as a small green dot (display only)
+            if result.face_landmarks:  # empty list means no face
+                points: Landmarks = result.face_landmarks[0]  # first (only) face
+                for p in points:
+                    cv2.circle(frame, (int(p.x * w), int(p.y * h)), 1, (0, 255, 0), -1)
 
-                # Per-frame measurements (EAR, head angles, asymmetry, nose position...)
-                signals: FrameSignals = build_frame_signals(timestamp_ms / 1000.0, result, w, h)
+            # Per-frame measurements, then the rolling window features
+            signals: FrameSignals = build_frame_signals(t, result, w, h)
+            self.extractor.add(signals)
+            features: Optional[WindowFeatures] = self.extractor.compute()
 
-                # Add this frame to the rolling window and compute the window features
-                # (None until the window has enough frames)
-                self.extractor.add(signals)
-                features: Optional[WindowFeatures] = self.extractor.compute()
-
-                # Publish the results so the main thread can read them
-                with self._lock:
-                    self.latest_frame = frame
-                    self.latest_ear = signals.ear  # None if no face
-                    self.latest_features = features
-        finally:
-            cap.release()  # always free the camera, even after an error
+            # Publish the results so the main thread can read them
+            with self._lock:
+                self.latest_frame = frame
+                self.latest_ear = signals.ear  # None if no face
+                self.latest_features = features
